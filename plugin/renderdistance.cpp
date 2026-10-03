@@ -1,3 +1,6 @@
+// Console command:  renderdist
+// Hotkey:           F12 (ignored with Shift held, so Shift+F12 switches only 3dcam)
+
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -234,14 +237,15 @@ ConsoleCommandResult __cdecl CmdRenderDist(D2R::Game::Client*, const ConsoleComm
     return ConsoleCommandResult::Handled;
 }
 
-// F12 polling. Runs outside the game thread, so it only logs.
+// F12 polling. Runs outside the game thread, so it only logs. Shift+F12 is ignored here, so
+// it switches only 3dcam: a safeguard for areas the extended distance is untested in.
 std::atomic<bool> g_quit{false};
 
 DWORD WINAPI KeyThread(void*) {
     for (bool f12Was = false; !g_quit.load(); Sleep(10)) {
         DWORD pid = 0; GetWindowThreadProcessId(GetForegroundWindow(), &pid);
         const bool f12 = pid == GetCurrentProcessId() && (GetAsyncKeyState(VK_F12) & 0x8000);
-        if (f12 && !f12Was) Log(Toggle());
+        if (f12 && !f12Was && !(GetAsyncKeyState(VK_SHIFT) & 0x8000)) Log(Toggle());
         f12Was = f12;
     }
     return 0;

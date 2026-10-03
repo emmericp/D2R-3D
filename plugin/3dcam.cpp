@@ -1,5 +1,5 @@
 // Console command:  3dcam
-// Hotkey:           F12
+// Hotkey:           F12 (Shift+F12 also works and leaves renderdistance alone)
 // While on: mouse wheel = zoom, middle mouse drag = orbit (yaw/pitch).
 
 #define WIN32_LEAN_AND_MEAN
