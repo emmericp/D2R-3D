@@ -1,4 +1,6 @@
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_pkg//pkg:mappings.bzl", "pkg_files")
+load("@rules_pkg//pkg:zip.bzl", "pkg_zip")
 load("//tools:windows_resource.bzl", "windows_resource")
 
 windows_resource(
@@ -27,3 +29,29 @@ windows_resource(
     "3dcam",
     "renderdistance",
 ]]
+
+# bazel build //plugin:dist
+# Output: bazel-bin/plugin/d2r-3d-plugins.zip
+pkg_files(
+    name = "dist_binaries",
+    srcs = [
+        ":d2rl-3dcam.dll",
+        ":d2rl-renderdistance.dll",
+    ],
+)
+
+# The plugins are built against the MIT-licensed PluginSDK headers.
+pkg_files(
+    name = "dist_licenses",
+    srcs = ["//plugin/third_party/sdk:LICENSE"],
+    renames = {"//plugin/third_party/sdk:LICENSE": "LICENSE-PluginSDK.txt"},
+)
+
+pkg_zip(
+    name = "dist",
+    srcs = [
+        ":dist_binaries",
+        ":dist_licenses",
+    ],
+    package_file_name = "d2r-3d-plugins.zip",
+)

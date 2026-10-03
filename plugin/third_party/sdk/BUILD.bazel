@@ -6,3 +6,8 @@ cc_library(
     includes = ["include"],
     visibility = ["//plugin:__pkg__"],
 )
+
+exports_files(
+    ["LICENSE"],
+    visibility = ["//plugin:__pkg__"],
+)

@@ -1,7 +1,7 @@
 # Diablo II: Resurrected in 3D
 
 Adds camera control to Diablo II: Resurrected.
-Press F12 to activate, mouse wheel to zoom, middle mouse down to drag the camera.
+Press F12 to activate, use the mouse wheel to zoom, and hold the middle mouse button and drag to rotate the camera.
 
 ![](img/diablo.jpg)
 ![](img/bloodraven.jpg)
@@ -29,5 +29,5 @@ Build output will be in `bazel-bin/standalone/dist/d2r-3d.{exe,dll}`.
 
 ## Plugin version
 
-`bazel build //plugin/...` creates the two plugins, one for the camera, one for the render distance.
-F12 enables both.
+`bazel build //plugin:dist` builds two plugins: one for the camera, one for the render distance.
+F12 enables both, Shift+F12 only enables the camera.

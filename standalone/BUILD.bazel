@@ -1,8 +1,10 @@
-load("@bazel_skylib//rules:copy_file.bzl", "copy_file")
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_pkg//pkg:mappings.bzl", "pkg_files")
+load("@rules_pkg//pkg:zip.bzl", "pkg_zip")
 
 # bazel build //standalone:dist
-# Output: bazel-bin/standalone/dist/d2r-3d.exe + d2r-3d.dll -> copy both into the D2R folder.
+# Output: bazel-bin/standalone/d2r-3d.zip (d2r-3d.exe + d2r-3d.dll + MinHook license)
+#   -> extract into the D2R folder.
 
 cc_binary(
     name = "d2r-3d.dll",
@@ -19,24 +21,26 @@ cc_binary(
     deps = ["//standalone/third_party/minhook"],
 )
 
-copy_file(
-    name = "dist_exe",
-    src = "//standalone/launcher:d2r-3d",
-    out = "dist/d2r-3d.exe",
-    allow_symlink = False,
+pkg_files(
+    name = "dist_binaries",
+    srcs = [
+        ":d2r-3d.dll",
+        "//standalone/launcher:d2r-3d",
+    ],
 )
 
-copy_file(
-    name = "dist_dll",
-    src = ":d2r-3d.dll",
-    out = "dist/d2r-3d.dll",
-    allow_symlink = False,
+# MinHook is linked into d2r-3d.dll; its BSD-2-Clause license must ship with the binary.
+pkg_files(
+    name = "dist_licenses",
+    srcs = ["//standalone/third_party/minhook:LICENSE.txt"],
+    renames = {"//standalone/third_party/minhook:LICENSE.txt": "LICENSE-MinHook.txt"},
 )
 
-filegroup(
+pkg_zip(
     name = "dist",
     srcs = [
-        ":dist_dll",
-        ":dist_exe",
+        ":dist_binaries",
+        ":dist_licenses",
     ],
+    package_file_name = "d2r-3d.zip",
 )

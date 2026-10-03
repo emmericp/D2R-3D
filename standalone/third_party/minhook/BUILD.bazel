@@ -18,3 +18,8 @@ cc_library(
     target_compatible_with = ["@platforms//os:windows"],
     visibility = ["//standalone:__pkg__"],
 )
+
+exports_files(
+    ["LICENSE.txt"],
+    visibility = ["//standalone:__pkg__"],
+)

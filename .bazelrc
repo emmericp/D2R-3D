@@ -1,7 +1,8 @@
 # Windows/MSVC x64 only, by design (D2R is x64).
 #   bazel build //...
-# Outputs: bazel-bin/standalone/dist/d2r-3d.{exe,dll} -> D2R folder
-#          bazel-bin/plugin/d2rl-*.dll     -> <D2R>\d2rloader\plugins\
+# Release zips: bazel build //standalone:dist //plugin:dist
+#   bazel-bin/standalone/d2r-3d.zip      -> extract into the D2R folder
+#   bazel-bin/plugin/d2r-3d-plugins.zip  -> DLLs into <D2R>\d2rloader\plugins\
 
 build --compilation_mode=opt
 build --features=static_link_msvcrt   # /MT: no VC++ redistributable needed
