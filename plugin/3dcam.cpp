@@ -1,5 +1,6 @@
-// Console command:  3dcam
+// Console commands: 3dcam, 3dcam_follow
 // Hotkey:           F12 (Shift+F12 also works and leaves renderdistance alone)
+// F11 toggles smooth character-facing follow; middle drag temporarily overrides it.
 // While on: mouse wheel = zoom, middle mouse drag = orbit (yaw/pitch).
 
 #define WIN32_LEAN_AND_MEAN
@@ -15,6 +16,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <sstream>
+#include <string>
+
+#include "follow_camera.h"
 
 #include <D2RLPlugin/context.h>
 #include <D2RLPlugin/lifecycle.h>
@@ -45,6 +50,14 @@ const uint8_t kSigCopyCall[5]     = {0xE8,0x6D,0xE3,0xFF,0xFF};
 const uint8_t kSigGetProj[16]     = {0x48,0x8B,0xC4,0x53,0x48,0x81,0xEC,0x80,0x00,0x00,0x00,0x80,0xB9,0x70,0x01,0x00};
 const uint8_t kSigViewRebuild[16] = {0x48,0x89,0x5C,0x24,0x10,0x48,0x89,0x74,0x24,0x18,0x57,0x48,0x81,0xEC,0xB0,0x00};
 const uint8_t kSigRayBuild[16]    = {0x48,0x8B,0xC4,0x48,0x89,0x58,0x08,0x48,0x89,0x70,0x10,0x55,0x57,0x41,0x56,0x48};
+
+// Verified read-only native getters for build 93847. Never interpret a player
+// handle from the SDK as a raw pointer. Disable follow if these signatures change.
+constexpr uint64_t RVA_PLAYER_SLOT = 0x8B2D0, RVA_PLAYER_BY_SLOT = 0x9A480,
+                   RVA_PATH_FACING = 0x341970;
+const uint8_t kSigPlayerSlot[] = {0x8B,0x05,0x2E,0x84,0x99,0x02,0xC3};
+const uint8_t kSigPlayerBySlot[] = {0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x83,0xF9,0x08,0x0F,0x83,0x85,0x00,0x00,0x00};
+const uint8_t kSigPathFacing[] = {0x48,0x85,0xC9,0x75,0x04,0x0F,0x57,0xC0,0xC3,0xF3,0x0F,0x10,0x81,0x80,0x00,0x00,0x00,0xC3};
 
 constexpr size_t C_VIEW = 0x10, C_INVVIEW = 0x50, C_PROJ = 0x90, C_LOOKAT = 0x11C, C_LOOKAT_OK = 0x128,
                  C_EXTW = 0x148, C_EXTH = 0x14C, C_VPW = 0x150, C_VPH = 0x154, C_NEAR = 0x158,
@@ -95,8 +108,83 @@ std::atomic<bool> g_enabled{false};
 std::atomic<float> g_dist{kDist}, g_pitch{kPitch}, g_yaw{0.0f};
 std::atomic<uint32_t> g_gen{1};
 std::atomic<uintptr_t> g_master{0};
+std::atomic<bool> g_follow{true}, g_followFault{false}, g_mmbDown{false};
+std::atomic<float> g_followYaw{0.0f};
+std::atomic<ULONGLONG> g_manualUntil{0};
+std::atomic<uint32_t> g_followEpoch{1};
+bool g_facingOk = false;
+float g_followSpeed = 6.0f;
 
-struct Cam { uintptr_t ptr; float proj0[16]; float extW, extH, nearZ; int type; bool haveBase, written; uint32_t lastGen; float lookSign; };
+constexpr const char* kFollowConfig =
+    "# F11 toggles follow; F12 enables the 3D camera.\n"
+    "[camera]\nfollow_enabled = true\nfollow_speed = 6.0\n";
+
+void LoadFollowConfig() {
+    if (!g_ctx || !g_ctx->EnsureConfig(kFollowConfig)) return;
+    char config[4096]{};
+    if (!g_ctx->ReadConfig(config, sizeof config)) return;
+    std::istringstream lines(config);
+    std::string line;
+    bool cameraSection = false;
+    while (std::getline(lines, line)) {
+        line = line.substr(0, line.find('#'));
+        const auto start = line.find_first_not_of(" \t\r");
+        if (start == std::string::npos) continue;
+        line = line.substr(start, line.find_last_not_of(" \t\r") - start + 1);
+        if (line.front() == '[') { cameraSection = line == "[camera]"; continue; }
+        if (!cameraSection) continue;
+        const auto equals = line.find('=');
+        if (equals == std::string::npos || equals == 0) continue;
+        const auto name = line.substr(0, line.find_last_not_of(" \t", equals - 1) + 1);
+        const auto valueStart = line.find_first_not_of(" \t", equals + 1);
+        if (valueStart == std::string::npos) continue;
+        const auto value = line.substr(valueStart);
+        if (name == "follow_enabled" && (value == "true" || value == "false")) g_follow.store(value == "true");
+        else if (name == "follow_speed") {
+            char* end = nullptr;
+            const float speed = strtof(value.c_str(), &end);
+            if (end != value.c_str() && *end == '\0' && std::isfinite(speed)) g_followSpeed = std::clamp(speed, 0.5f, 20.0f);
+        }
+    }
+}
+
+void SaveFollowConfig() {
+    char config[256];
+    snprintf(config, sizeof config, "# F11 toggles follow; restart after changing follow_speed.\n[camera]\nfollow_enabled = %s\nfollow_speed = %.3f\n",
+             g_follow.load() ? "true" : "false", g_followSpeed);
+    if (g_ctx && !g_ctx->WriteConfig(config)) g_ctx->LogError("3dcam: could not save follow settings");
+}
+
+// Invoked on the camera hook's thread, with no changes to player data. Validate
+// path ownership and angle range; a teardown fault disables only follow mode.
+bool ReadPlayerFacing(float* facing, uintptr_t* identity) {
+    if (!g_facingOk || g_followFault.load()) return false;
+    __try {
+        const auto getSlot = (uint32_t (*)())(g_base + RVA_PLAYER_SLOT);
+        const auto getPlayer = (uintptr_t (*)(uint32_t))(g_base + RVA_PLAYER_BY_SLOT);
+        const auto getFacing = (float (*)(uintptr_t))(g_base + RVA_PATH_FACING);
+        const uint32_t slot = getSlot();
+        if (slot >= 8) return false;
+        const uintptr_t player = getPlayer(slot);
+        if (!player || F<uint32_t>(player, 0) != 0) return false;
+        const uintptr_t path = F<uintptr_t>(player, 0x38);
+        if (!path || F<uintptr_t>(path, 0x40) != player) return false;
+        const float direction = getFacing(path);
+        if (!std::isfinite(direction) || direction < 0.0f || direction >= 64.0f) return false;
+        *facing = direction; *identity = player;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (!g_followFault.exchange(true) && g_ctx) g_ctx->LogError("3dcam: facing read fault; follow disabled for this session");
+        return false;
+    }
+}
+
+struct Cam {
+    uintptr_t ptr; float proj0[16]; float extW, extH, nearZ; int type;
+    bool haveBase, written; uint32_t lastGen; float lookSign;
+    uint32_t followEpoch; uintptr_t followPlayer; LARGE_INTEGER followTick;
+    bool followReady; float followYaw;
+};
 SRWLOCK g_camLock = SRWLOCK_INIT;
 Cam g_cams[8];
 int g_camCount = 0;
@@ -149,6 +237,9 @@ uintptr_t HookGetProj(uintptr_t cam) {
         }
         const uint32_t gen = g_gen.load();
         if (c->lastGen != gen) { F<uint8_t>(cam, C_VDIRTY) = 1; c->lastGen = gen; }
+        // Native view caching must not freeze a smoothing turn when the player
+        // stops moving. Let the original code rebuild a clean view each frame.
+        if (g_enabled.load() && g_follow.load() && c->ptr == g_master.load()) F<uint8_t>(cam, C_VDIRTY) = 1;
         if (g_enabled.load() && c->ptr == g_master.load()) {
             float M[16]; BuildProj(*c, M);
             memcpy((void*)(cam + C_PROJ), M, 64);
@@ -175,10 +266,30 @@ void HookViewRebuild(uintptr_t cam) {
         }
         const float sgn = P[2] <= 0.0f ? -1.0f : 1.0f;
         const float d2r = 3.14159265f / 180.0f;
+        float yaw = g_yaw.load();
+        if (g_follow.load()) {
+            float facing = 0.0f; uintptr_t player = 0;
+            LARGE_INTEGER now, frequency; QueryPerformanceCounter(&now); QueryPerformanceFrequency(&frequency);
+            if (ReadPlayerFacing(&facing, &player)) {
+                const uint32_t epoch = g_followEpoch.load();
+                if (!c->followReady || c->followEpoch != epoch || c->followPlayer != player) {
+                    c->followYaw = yaw; c->followTick = now; c->followReady = true;
+                    c->followEpoch = epoch; c->followPlayer = player;
+                }
+                const float seconds = (float)((double)(now.QuadPart - c->followTick.QuadPart) / frequency.QuadPart);
+                c->followTick = now;
+                if (g_mmbDown.load() || GetTickCount64() < g_manualUntil.load()) c->followYaw = yaw;
+                else {
+                    const float target = FollowCamera::TargetYaw(facing, view[2], view[10], sgn);
+                    c->followYaw = FollowCamera::Step(c->followYaw, target, seconds, g_followSpeed);
+                }
+                yaw = c->followYaw; g_followYaw.store(yaw);
+            } else c->followReady = false;
+        } else c->followReady = false;
         float R[16], Ry[16], RR[16];
         AxisRot4(R, 1, 0, 0, g_pitch.load() * d2r);
         const float un = sqrtf(view[4]*view[4] + view[5]*view[5] + view[6]*view[6]);   // world up in view space
-        if (g_yaw.load() != 0.0f && un > 1e-6f) { AxisRot4(Ry, view[4]/un, view[5]/un, view[6]/un, g_yaw.load() * d2r); Mul4(Ry, R, RR); memcpy(R, RR, 64); }
+        if (yaw != 0.0f && un > 1e-6f) { AxisRot4(Ry, view[4]/un, view[5]/un, view[6]/un, yaw * d2r); Mul4(Ry, R, RR); memcpy(R, RR, 64); }
         float A[16]; memcpy(A, R, 64);
         A[12] = -(P[0]*R[0] + P[1]*R[4] + P[2]*R[8]);
         A[13] = -(P[0]*R[1] + P[1]*R[5] + P[2]*R[9]);
@@ -236,7 +347,6 @@ void HookRayBuild(uintptr_t cam, float* mouse, float* origin, float* dir) {
 // Mouse
 HHOOK g_mouseHook = nullptr;
 DWORD g_mouseThreadId = 0;
-bool g_mmbDown = false;
 POINT g_mmbLast{};
 
 bool GameFocused() {
@@ -254,9 +364,12 @@ LRESULT CALLBACK MouseProc(int code, WPARAM w, LPARAM l) {
             g_dist.store(std::clamp(g_dist.load() / powf(1.12f, (float)steps), 3.5f, 1500.0f));
             g_gen.fetch_add(1);
             if (kWheelSwallow) return 1;
-        } else if (w == WM_MBUTTONDOWN) { g_mmbDown = true; g_mmbLast = ms->pt; }
-        else if (w == WM_MBUTTONUP) g_mmbDown = false;
-        else if (w == WM_MOUSEMOVE && g_mmbDown) {
+        } else if (w == WM_MBUTTONDOWN) {
+            if (g_follow.load()) g_yaw.store(g_followYaw.load());
+            g_mmbDown.store(true); g_mmbLast = ms->pt;
+        }
+        else if (w == WM_MBUTTONUP) { g_mmbDown.store(false); g_manualUntil.store(GetTickCount64() + 750); }
+        else if (w == WM_MOUSEMOVE && g_mmbDown.load()) {
             const int dx = ms->pt.x - g_mmbLast.x, dy = ms->pt.y - g_mmbLast.y;
             g_mmbLast = ms->pt;
             float yaw = g_yaw.load() + dx * 0.25f;
@@ -265,7 +378,8 @@ LRESULT CALLBACK MouseProc(int code, WPARAM w, LPARAM l) {
             g_pitch.store(std::clamp(g_pitch.load() + dy * 0.15f, -85.0f, 60.0f));
             g_gen.fetch_add(1);
         }
-    } else if (code == HC_ACTION && w == WM_MBUTTONUP) g_mmbDown = false;
+    } else if (code == HC_ACTION && w == WM_MBUTTONUP) g_mmbDown.store(false);
+    if (code == HC_ACTION && !GameFocused()) g_mmbDown.store(false);
     return CallNextHookEx(g_mouseHook, code, w, l);
 }
 
@@ -276,8 +390,24 @@ const char* Toggle() {
     const bool on = !g_enabled.load();
     g_enabled.store(on);
     g_gen.fetch_add(1);
+    g_followEpoch.fetch_add(1);
     if (on && !g_master.load()) return "3dcam ON - waiting for the world camera (enter a game)";
-    return on ? "3dcam ON (mouse wheel = zoom, middle mouse drag = orbit)" : "3dcam OFF";
+    return on ? "3dcam ON (F11 = follow toggle, mouse wheel = zoom, middle drag = orbit)" : "3dcam OFF";
+}
+
+const char* ToggleFollow() {
+    if (!g_facingOk || g_followFault.load()) return "3dcam follow unavailable on this game build (see log)";
+    const bool on = !g_follow.load();
+    if (!on) g_yaw.store(g_followYaw.load()); // Keep the current view when returning to free orbit.
+    g_follow.store(on); g_followEpoch.fetch_add(1); g_gen.fetch_add(1);
+    g_manualUntil.store(0);
+    SaveFollowConfig();
+    return on ? "3dcam follow ON (smoothly stays behind character; F11 = free orbit)" : "3dcam follow OFF (free orbit; F11 = follow)";
+}
+
+ConsoleCommandResult __cdecl CmdFollow(D2R::Game::Client*, const ConsoleCommandContext*, void*) noexcept {
+    Say(ToggleFollow());
+    return ConsoleCommandResult::Handled;
 }
 
 ConsoleCommandResult __cdecl Cmd3dcam(D2R::Game::Client*, const ConsoleCommandContext*, void*) noexcept {
@@ -289,13 +419,16 @@ ConsoleCommandResult __cdecl Cmd3dcam(D2R::Game::Client*, const ConsoleCommandCo
 DWORD WINAPI MouseThread(void*) {
     g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseProc, g_self, 0);
     SetTimer(nullptr, 0, 10, nullptr);
-    bool f12Was = false;
+    bool f12Was = false, f11Was = false;
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {
         if (m.message == WM_TIMER) {
             const bool f12 = GameFocused() && (GetAsyncKeyState(VK_F12) & 0x8000);
             if (f12 && !f12Was && g_ctx) g_ctx->LogInfo(Toggle());
             f12Was = f12;
+            const bool f11 = GameFocused() && (GetAsyncKeyState(VK_F11) & 0x8000);
+            if (f11 && !f11Was && g_ctx) g_ctx->LogInfo(ToggleFollow());
+            f11Was = f11;
             if (g_master.load() && !g_masterLogged.exchange(true) && g_ctx) {
                 char b[96];
                 snprintf(b, sizeof b, "3dcam: world camera %p (projection type %d)", (void*)g_master.load(), F<int32_t>(g_master.load(), C_TYPE));
@@ -312,8 +445,8 @@ DWORD WINAPI MouseThread(void*) {
 }  // namespace
 
 static const PluginInfo g_info = {
-    PluginInfoSize, D2RL_PLUGIN_API_VERSION, "d2r-3d-3dcam", "3dcam", "1.0.0", "Tandanu",
-    "Perspective 3D camera with orbit, zoom, corrected targeting and shadow fit. Press F12 to enable.",
+    PluginInfoSize, D2RL_PLUGIN_ABI_VERSION, "d2r-3d-3dcam", "3dcam", "1.1.0", "Tandanu (local follow-camera extension)",
+    "3D camera with smooth character-facing follow. F12: camera. F11: follow/free orbit. Wheel: zoom. Middle drag: orbit.",
     PluginFlags::Shared | PluginFlags::NativeHooks, {0, 0, 0, 0},
 };
 
@@ -323,6 +456,11 @@ D2RL_PLUGIN_EXPORT bool D2RLoaderLoadPlugin(const PluginContext* ctx) noexcept {
     g_ctx = ctx;
     if (!ctx) return true;
     g_base = ctx->exeBase ? ctx->exeBase : (uintptr_t)GetModuleHandleW(nullptr);
+    LoadFollowConfig();
+    g_facingOk = ctx->CheckExpectedBytes(RVA_PLAYER_SLOT, kSigPlayerSlot, sizeof kSigPlayerSlot) &&
+                 ctx->CheckExpectedBytes(RVA_PLAYER_BY_SLOT, kSigPlayerBySlot, sizeof kSigPlayerBySlot) &&
+                 ctx->CheckExpectedBytes(RVA_PATH_FACING, kSigPathFacing, sizeof kSigPathFacing);
+    ctx->LogInfo(g_facingOk ? "3dcam: native character-facing getters verified" : "3dcam: facing getter mismatch; follow unavailable");
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)&Cmd3dcam, &g_self);
     const bool hc = memcmp((void*)(g_base + RVA_COPY_CALL), kSigCopyCall, sizeof kSigCopyCall) == 0 &&
                     ctx->InstallInlineHook(RVA_CAMCOPY, kSigCamCopy, sizeof kSigCamCopy, (void*)&HookCamCopy, (void**)&OrigCamCopy);
@@ -334,8 +472,10 @@ D2RL_PLUGIN_EXPORT bool D2RLoaderLoadPlugin(const PluginContext* ctx) noexcept {
     snprintf(b, sizeof b, "3dcam loaded: camCopy=%s getProj=%s viewRebuild=%s rayBuild=%s%s", hc ? "ok" : "FAIL", h1 ? "ok" : "FAIL", h2 ? "ok" : "FAIL", h3 ? "ok" : "FAIL",
              h3 ? "" : " (targeting + shadow fit unavailable)");
     ctx->LogInfo(b);
+    ctx->LogInfo(g_follow.load() ? "3dcam follow enabled by config (F11 toggles)" : "3dcam free orbit enabled by config (F11 toggles)");
     if (HANDLE h = CreateThread(nullptr, 0, MouseThread, nullptr, 0, &g_mouseThreadId)) CloseHandle(h);
     if (!ctx->RegisterConsoleCommand("3dcam", &Cmd3dcam, "3dcam - switch the perspective 3D camera on/off")) ctx->LogError("3dcam: could not register the console command");
+    if (!ctx->RegisterConsoleCommand("3dcam_follow", &CmdFollow, "3dcam_follow - toggle smooth character-facing follow (F11)")) ctx->LogError("3dcam: could not register the follow command");
     return true;
 }
 

@@ -31,3 +31,21 @@ Build output will be in `bazel-bin/standalone/dist/d2r-3d.{exe,dll}`.
 
 `bazel build //plugin:dist` builds two plugins: one for the camera, one for the render distance.
 F12 enables both, Shift+F12 only enables the camera.
+
+### Local character-follow camera
+
+The camera plugin adds smooth third-person follow using the local player's native facing angle. Follow is enabled by default when the 3D camera is enabled. **F11** switches between follow and free orbit and saves the choice. The mouse wheel zooms; middle-mouse dragging temporarily overrides follow, which resumes 0.75 seconds after release. Turning while stationary is supported.
+
+Settings are stored in `d2rloader/config/d2r-3d-3dcam.toml`. Set `follow_enabled` to `true` or `false` and adjust `follow_speed` (0.5–20.0, default 6.0) to change how quickly the camera catches up. Restart after manually editing settings. The optional developer-console command `3dcam_follow` toggles the same setting.
+
+This extension has been tested with D2RLoader 1.3.1-beta, PluginSDK 0.3.0 / ABI 4, and game build 93847. Native facing getters are checked against expected code signatures before use; unsupported getters disable follow without replacing the original camera controls. The character movement controls remain those supplied by the game.
+
+For a CMake build, put a PluginSDK checkout beside this repository:
+
+```text
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
+```
+
+The DLLs are written to `build/Release`. Put them in the game's `d2rloader/plugins` folder while the game is closed. Tests cover camera alignment, direction wraparound, smoothing across frame rates, and pause handling.

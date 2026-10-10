@@ -254,7 +254,7 @@ DWORD WINAPI KeyThread(void*) {
 }  // namespace
 
 static const PluginInfo g_info = {
-    PluginInfoSize, D2RL_PLUGIN_API_VERSION, "d2r-3d-renderdistance", "renderdistance", "1.0.0", "Tandanu",
+    PluginInfoSize, D2RL_PLUGIN_ABI_VERSION, "d2r-3d-renderdistance", "renderdistance", "1.0.0", "Tandanu",
     "Extended render distance: builds and renders far rooms and their models. Press F12 to enable.",
     PluginFlags::Shared | PluginFlags::NativeHooks, {0, 0, 0, 0},
 };
