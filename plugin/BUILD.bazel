@@ -11,7 +11,7 @@ windows_resource(
 
 [cc_binary(
     name = "d2rl-%s.dll" % plugin,
-    srcs = ["%s.cpp" % plugin],
+    srcs = ["%s.cpp" % plugin] + glob(["*.h"]),
     copts = [
         "/utf-8",
         "/W3",

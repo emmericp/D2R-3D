@@ -6,6 +6,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include "camera_frame.h"
 
 #include <algorithm>
 #include <atomic>
@@ -242,10 +243,28 @@ ConsoleCommandResult __cdecl CmdRenderDist(D2R::Game::Client*, const ConsoleComm
 std::atomic<bool> g_quit{false};
 
 DWORD WINAPI KeyThread(void*) {
+    bool defaultChecked=false, defaultPending=false;
     for (bool f12Was = false; !g_quit.load(); Sleep(10)) {
+        if (!defaultChecked || defaultPending) {
+            const HMODULE camera=GetModuleHandleW(L"d2rl-3dcam.dll");
+            const auto isEnabled=camera?(bool (*)())GetProcAddress(camera,"D2R3DIsCameraEnabled"):nullptr;
+            const auto getFrame=camera?(bool (*)(D2R3DCameraFrame*,uint32_t))GetProcAddress(camera,"D2R3DGetCameraFrame"):nullptr;
+            if (isEnabled && getFrame) {
+                if (!defaultChecked) { defaultChecked=true; defaultPending=isEnabled(); }
+                D2R3DCameraFrame frame{};
+                // Wait for the world view; native pools/radius objects are not
+                // ready during plugin loading. Keep ordinary F12/Shift+F12 behavior.
+                if (defaultPending && isEnabled() && getFrame(&frame,sizeof frame) && frame.active && frame.reserved) {
+                    Log(Toggle()); defaultPending=false;
+                }
+            }
+        }
         DWORD pid = 0; GetWindowThreadProcessId(GetForegroundWindow(), &pid);
         const bool f12 = pid == GetCurrentProcessId() && (GetAsyncKeyState(VK_F12) & 0x8000);
-        if (f12 && !f12Was && !(GetAsyncKeyState(VK_SHIFT) & 0x8000)) Log(Toggle());
+        if (f12 && !f12Was) {
+            if (defaultPending) defaultPending=false; // Turning off before entering a world needs no render-distance toggle.
+            else if (!(GetAsyncKeyState(VK_SHIFT) & 0x8000)) Log(Toggle());
+        }
         f12Was = f12;
     }
     return 0;
@@ -254,8 +273,8 @@ DWORD WINAPI KeyThread(void*) {
 }  // namespace
 
 static const PluginInfo g_info = {
-    PluginInfoSize, D2RL_PLUGIN_ABI_VERSION, "d2r-3d-renderdistance", "renderdistance", "1.0.0", "Tandanu",
-    "Extended render distance: builds and renders far rooms and their models. Press F12 to enable.",
+    PluginInfoSize, D2RL_PLUGIN_ABI_VERSION, "d2r-3d-renderdistance", "renderdistance", "1.0.1", "Tandanu",
+    "Extended render distance: starts with the default 3D world view. F12 toggles; Shift+F12 changes only the camera.",
     PluginFlags::Shared | PluginFlags::NativeHooks, {0, 0, 0, 0},
 };
 
